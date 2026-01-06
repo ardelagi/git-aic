@@ -1,0 +1,578 @@
+#!/bin/bash
+
+# =============================================================================
+# git-aic - AI-Powered Git Commit Message Generator
+# Global version for any repository
+# =============================================================================
+
+set -e
+
+VERSION="2.0.0"
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+get_config() {
+  local key="$1"
+  local default="$2"
+  git config --get "commit-ai.$key" 2>/dev/null || echo "$default"
+}
+
+API_KEY=$(get_config "api-key" "")
+PROVIDER=$(get_config "provider" "gemini")
+MODEL=$(get_config "model" "")
+MAX_DIFF=$(get_config "max-diff-size" "12000")
+ENABLE_CHANGELOG=$(get_config "changelog" "true")
+TEMPLATE_FILE=$(get_config "template" "$HOME/.config/git-ai-commit/template.txt")
+GITHUB_TOKEN=$(get_config "github-token" "${GITHUB_TOKEN:-}")
+
+# =============================================================================
+# HELP & SETUP
+# =============================================================================
+
+show_help() {
+  cat << EOF
+git-aic v$VERSION - AI-Powered Commit Message Generator
+
+USAGE:
+  git aic [OPTIONS]
+
+OPTIONS:
+  -h, --help          Show this help
+  -v, --version       Show version
+  -d, --dry-run       Preview without committing
+  -i, --interactive   Review before committing
+  --setup             Interactive setup wizard
+  --release           Create GitHub release after commit
+  --changelog-only    Generate GitHub release for existing tag
+
+CONFIGURATION:
+  git config --global commit-ai.api-key "YOUR_KEY"
+  git config --global commit-ai.provider "gemini|openai|anthropic"
+  git config --global commit-ai.model "model-name"
+  git config --global commit-ai.changelog "true|false"
+  git config --global commit-ai.max-diff-size "12000"
+
+EXAMPLES:
+  git aic                 # Auto commit with AI message
+  git aic -d              # Preview message only
+  git aic -i              # Interactive mode
+  git aic --setup         # Setup configuration
+
+MORE INFO:
+  https://github.com/ardelagi/git-aic
+EOF
+}
+
+setup_wizard() {
+  echo "=== git-aic Setup Wizard ==="
+  echo ""
+  
+  # Provider selection
+  echo "Select AI Provider:"
+  echo "1) Gemini (Google)"
+  echo "2) OpenAI (GPT)"
+  echo "3) Anthropic (Claude)"
+  read -p "Choice [1]: " provider_choice
+  
+  case ${provider_choice:-1} in
+    1) PROVIDER="gemini" ;;
+    2) PROVIDER="openai" ;;
+    3) PROVIDER="anthropic" ;;
+  esac
+  
+  # API Key
+  read -p "Enter API Key: " api_key
+  
+  # Changelog
+  read -p "Enable CHANGELOG.md updates? (y/n) [y]: " changelog
+  changelog=${changelog:-y}
+  
+  # Save config
+  git config --global commit-ai.provider "$PROVIDER"
+  git config --global commit-ai.api-key "$api_key"
+  git config --global commit-ai.changelog "$([ "$changelog" = "y" ] && echo true || echo false)"
+  
+  echo ""
+  echo "✓ Configuration saved!"
+  echo ""
+  echo "You can now use: git aic"
+  exit 0
+}
+
+# =============================================================================
+# VALIDATION
+# =============================================================================
+
+validate_environment() {
+  # Check git repo
+  if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo "❌ Error: Not a git repository"
+    exit 1
+  fi
+  
+  # Check API key
+  if [ -z "$API_KEY" ]; then
+    echo "❌ Error: API key not configured"
+    echo ""
+    echo "Run setup wizard: git aic --setup"
+    echo "Or manually: git config --global commit-ai.api-key YOUR_KEY"
+    exit 1
+  fi
+  
+  # Check required commands
+  for cmd in git curl jq; do
+    if ! command -v $cmd &> /dev/null; then
+      echo "❌ Error: Required command not found: $cmd"
+      exit 1
+    fi
+  done
+}
+
+# =============================================================================
+# SCOPE DETECTION
+# =============================================================================
+
+detect_scope() {
+  local files="$1"
+  
+  # Frontend frameworks
+  if echo "$files" | grep -Eq '^(src/components?|components?|ui)/'; then
+    echo "ui"
+  elif echo "$files" | grep -Eq '^(src/pages?|pages?|views?)/'; then
+    echo "pages"
+  # Backend
+  elif echo "$files" | grep -Eq '^(api|src/api|server|routes|controllers)/'; then
+    echo "api"
+  elif echo "$files" | grep -Eq '^(services?|lib|utils?|helpers?)/'; then
+    echo "core"
+  # Database
+  elif echo "$files" | grep -Eq '^(migrations?|database|db|prisma|schema)/'; then
+    echo "db"
+  # Infrastructure
+  elif echo "$files" | grep -Eq '^(docker|\.github|\.gitlab|deploy|\.circleci)/'; then
+    echo "infra"
+  elif echo "$files" | grep -Eq '^(test|tests|__tests__|spec|e2e)/'; then
+    echo "test"
+  # Config
+  elif echo "$files" | grep -Eq '\.(config\.|rc\.|env|yml|yaml|toml|ini|json)$'; then
+    echo "config"
+  # Docs
+  elif echo "$files" | grep -Eq '\.(md|txt|rst|adoc)$'; then
+    echo "docs"
+  # Styles
+  elif echo "$files" | grep -Eq '\.(css|scss|sass|less|styl)$'; then
+    echo "style"
+  # Assets
+  elif echo "$files" | grep -Eq '\.(png|jpg|jpeg|gif|svg|ico|woff|ttf)$'; then
+    echo "assets"
+  fi
+}
+
+# =============================================================================
+# BREAKING CHANGE DETECTION
+# =============================================================================
+
+detect_breaking() {
+  # File deleted
+  if git diff --cached --name-status | grep -q '^D'; then
+    return 0
+  fi
+  
+  # API/interface changes (removed exports/functions)
+  if git diff --cached | grep -Eq '^\-.*export (default |class |function |const |let )'; then
+    return 0
+  fi
+  
+  # Major version bump in package.json
+  if git diff --cached package.json 2>/dev/null | grep -Eq '^\+.*"version".*"[0-9]+\.0\.0"'; then
+    return 0
+  fi
+  
+  # Breaking change in commit message
+  if git diff --cached | grep -iq 'BREAKING CHANGE'; then
+    return 0
+  fi
+  
+  return 1
+}
+
+# =============================================================================
+# AI PROVIDERS
+# =============================================================================
+
+generate_gemini() {
+  local prompt="$1"
+  
+  local json=$(jq -n --arg prompt "$prompt" '{
+    contents: [
+      { "role": "user", "parts": [{ "text": $prompt }] }
+    ]
+  }')
+  
+  local response=$(curl -s \
+    -H "Content-Type: application/json" \
+    -X POST \
+    "https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}" \
+    -d "$json")
+  
+  echo "$response" | jq -r '.candidates[0].content.parts[0].text // empty'
+}
+
+generate_openai() {
+  local prompt="$1"
+  
+  local json=$(jq -n --arg prompt "$prompt" '{
+    model: "gpt-4o-mini",
+    messages: [
+      { "role": "user", "content": $prompt }
+    ],
+    temperature: 0.7
+  }')
+  
+  local response=$(curl -s \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${API_KEY}" \
+    -X POST \
+    "https://api.openai.com/v1/chat/completions" \
+    -d "$json")
+  
+  echo "$response" | jq -r '.choices[0].message.content // empty'
+}
+
+generate_anthropic() {
+  local prompt="$1"
+  
+  local json=$(jq -n --arg prompt "$prompt" '{
+    model: "claude-3-5-sonnet-20241022",
+    max_tokens: 1024,
+    messages: [
+      { "role": "user", "content": $prompt }
+    ]
+  }')
+  
+  local response=$(curl -s \
+    -H "Content-Type: application/json" \
+    -H "x-api-key: ${API_KEY}" \
+    -H "anthropic-version: 2023-06-01" \
+    -X POST \
+    "https://api.anthropic.com/v1/messages" \
+    -d "$json")
+  
+  echo "$response" | jq -r '.content[0].text // empty'
+}
+
+generate_commit_message() {
+  local prompt="$1"
+  
+  case $PROVIDER in
+    gemini)
+      generate_gemini "$prompt"
+      ;;
+    openai)
+      generate_openai "$prompt"
+      ;;
+    anthropic)
+      generate_anthropic "$prompt"
+      ;;
+    *)
+      echo "❌ Unknown provider: $PROVIDER"
+      exit 1
+      ;;
+  esac
+}
+
+# =============================================================================
+# COMMIT MESSAGE GENERATION
+# =============================================================================
+
+create_commit() {
+  local dry_run="$1"
+  local interactive="$2"
+  
+  # Stage all changes
+  git add .
+  
+  # Check if there are changes
+  if git diff --cached --quiet; then
+    echo "ℹ️  No changes to commit"
+    exit 0
+  fi
+  
+  echo "🔍 Analyzing changes..."
+  
+  # Get changed files
+  FILES=$(git diff --cached --name-only)
+  
+  # Detect scope
+  SCOPE=$(detect_scope "$FILES")
+  
+  # Detect breaking changes
+  BREAKING=false
+  if detect_breaking; then
+    BREAKING=true
+  fi
+  
+  # Get diff for AI
+  DIFF=$(git diff --cached --unified=4 | head -c "$MAX_DIFF")
+  
+  # Load custom template if exists
+  CUSTOM_INSTRUCTIONS=""
+  if [ -f "$TEMPLATE_FILE" ]; then
+    CUSTOM_INSTRUCTIONS=$(cat "$TEMPLATE_FILE")
+  fi
+  
+  # Build prompt
+  PROMPT="You are a senior software engineer writing git commit messages.
+
+${CUSTOM_INSTRUCTIONS}
+
+Generate a conventional commit message with:
+1. A title line following format: type(scope): description
+2. A commit body with 2-4 concise bullet points
+
+Rules:
+- Types: feat, fix, refactor, chore, docs, style, test, perf, ci, build
+- Detected scope: ${SCOPE:-none}
+- Breaking change detected: ${BREAKING}
+- Add ! after type if breaking (e.g., feat!)
+- Bullet points must start with '- '
+- No markdown formatting (no **, no ##)
+- Be concise, technical, and specific
+- Focus on WHAT changed and WHY, not HOW
+
+Git diff:
+$DIFF
+"
+
+  echo "🤖 Generating commit message..."
+  
+  # Call AI
+  TEXT=$(generate_commit_message "$PROMPT")
+  
+  # Validate response
+  if [ -z "$TEXT" ]; then
+    echo "❌ Error: Failed to generate commit message"
+    echo "Check your API key and provider configuration"
+    exit 1
+  fi
+  
+  # Parse response
+  TITLE=$(echo "$TEXT" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  BODY=$(echo "$TEXT" | tail -n +2 | sed '/^$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  
+  # Enforce format
+  TYPE=$(echo "$TITLE" | cut -d':' -f1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  DESC=$(echo "$TITLE" | cut -d':' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  
+  # Add breaking change indicator
+  if $BREAKING && [[ "$TYPE" != *"!"* ]]; then
+    TYPE="${TYPE}!"
+  fi
+  
+  # Add scope if detected and not present
+  if [ -n "$SCOPE" ] && ! echo "$TYPE" | grep -q '('; then
+    TYPE=$(echo "$TYPE" | sed "s/^\([^!]*\)\(!\?\)$/\1($SCOPE)\2/")
+  fi
+  
+  FINAL_TITLE="$TYPE: $DESC"
+  
+  # Fallback body if empty
+  if [ -z "$BODY" ]; then
+    BODY=$(git diff --cached --name-status | head -n 5 | awk '
+      $1=="A"{print "- Added "$2}
+      $1=="M"{print "- Updated "$2}
+      $1=="D"{print "- Removed "$2}
+    ')
+  fi
+  
+  # Show preview
+  echo ""
+  echo "📝 Generated commit message:"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "$FINAL_TITLE"
+  echo ""
+  echo "$BODY"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  
+  # Dry run mode
+  if [ "$dry_run" = true ]; then
+    echo "🔍 Dry run mode - no commit created"
+    exit 0
+  fi
+  
+  # Interactive mode
+  if [ "$interactive" = true ]; then
+    read -p "Accept this message? (y/n/e to edit): " choice
+    case $choice in
+      e)
+        TEMP_FILE=$(mktemp)
+        echo "$FINAL_TITLE" > "$TEMP_FILE"
+        echo "" >> "$TEMP_FILE"
+        echo "$BODY" >> "$TEMP_FILE"
+        ${EDITOR:-nano} "$TEMP_FILE"
+        FINAL_TITLE=$(head -n 1 "$TEMP_FILE")
+        BODY=$(tail -n +3 "$TEMP_FILE")
+        rm "$TEMP_FILE"
+        ;;
+      n)
+        echo "❌ Commit cancelled"
+        exit 0
+        ;;
+    esac
+  fi
+  
+  # Commit
+  git commit -m "$FINAL_TITLE" -m "$BODY"
+  
+  echo "✅ Commit created successfully"
+  
+  # Update changelog
+  if [ "$ENABLE_CHANGELOG" = "true" ]; then
+    update_changelog "$FINAL_TITLE"
+  fi
+}
+
+# =============================================================================
+# CHANGELOG
+# =============================================================================
+
+update_changelog() {
+  local title="$1"
+  local date=$(date +%Y-%m-%d)
+  
+  if [ ! -f CHANGELOG.md ]; then
+    echo "# Changelog" > CHANGELOG.md
+    echo "" >> CHANGELOG.md
+    echo "All notable changes to this project will be documented in this file." >> CHANGELOG.md
+    echo "" >> CHANGELOG.md
+  fi
+  
+  if ! grep -q "## $date" CHANGELOG.md; then
+    # Insert new date section after header
+    sed -i "/^# Changelog/a\\
+\\
+## $date" CHANGELOG.md
+  fi
+  
+  # Add entry under today's date
+  sed -i "/## $date/a\\
+- $title" CHANGELOG.md
+  
+  echo "📋 CHANGELOG.md updated"
+}
+
+# =============================================================================
+# GITHUB RELEASE INTEGRATION
+# =============================================================================
+
+create_github_release() {
+  local tag="$1"
+  
+  echo ""
+  echo "🚀 Creating GitHub release..."
+  
+  # Check if git-aic-changelog is available
+  if ! command -v git-aic-changelog &> /dev/null; then
+    echo "⚠️  git-aic-changelog not found"
+    echo "Install it to enable GitHub release creation"
+    return
+  fi
+  
+  # Check if we have a tag
+  if [ -z "$tag" ]; then
+    echo "⚠️  No git tag found, skipping GitHub release"
+    return
+  fi
+  
+  # Create release
+  git-aic-changelog "$tag" --ai
+}
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+main() {
+  local dry_run=false
+  local interactive=false
+  local create_release=false
+  local changelog_only=false
+  local release_tag=""
+  
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -h|--help)
+        show_help
+        exit 0
+        ;;
+      -v|--version)
+        echo "git-aic v$VERSION"
+        exit 0
+        ;;
+      -d|--dry-run)
+        dry_run=true
+        shift
+        ;;
+      -i|--interactive)
+        interactive=true
+        shift
+        ;;
+      --setup)
+        setup_wizard
+        ;;
+      --release)
+        create_release=true
+        shift
+        ;;
+      --changelog-only)
+        changelog_only=true
+        release_tag="$2"
+        shift 2
+        ;;
+      *)
+        echo "Unknown option: $1"
+        echo "Use -h for help"
+        exit 1
+        ;;
+    esac
+  done
+  
+  # Validate
+  validate_environment
+  
+  # Changelog-only mode
+  if [ "$changelog_only" = true ]; then
+    if ! command -v git-aic-changelog &> /dev/null; then
+      echo "❌ Error: git-aic-changelog not installed"
+      exit 1
+    fi
+    
+    if [ -z "$release_tag" ]; then
+      echo "Usage: git-aic --changelog-only TAG"
+      exit 1
+    fi
+    
+    git-aic-changelog "$release_tag" --ai
+    exit 0
+  fi
+  
+  # Create commit
+  create_commit "$dry_run" "$interactive"
+  
+  # Create GitHub release if requested
+  if [ "$create_release" = true ]; then
+    local latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+    if [ -n "$latest_tag" ]; then
+      create_github_release "$latest_tag"
+    else
+      echo "⚠️  No git tag found for release creation"
+      echo "Create a tag first: git tag v1.0.0"
+    fi
+  fi
+}
+
+main "$@"

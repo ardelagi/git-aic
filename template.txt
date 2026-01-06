@@ -1,0 +1,43 @@
+Additional instructions for commit message generation:
+
+STYLE GUIDELINES:
+
+- Use imperative mood (“add feature” not “added feature”)
+- Keep title under 50 characters
+- Wrap body at 72 characters
+- Use present tense
+- Be specific and concise
+
+CONTENT FOCUS:
+
+- Emphasize user-facing changes
+- Explain WHY the change was made, not just WHAT
+- Include impact on performance or behavior if significant
+- Mention related issue/ticket numbers if visible in comments
+
+TECHNICAL DETAILS:
+
+- For bug fixes: briefly describe the bug and the fix
+- For features: describe the new capability
+- For refactors: explain the improvement or simplification
+- For performance: include metrics if available
+
+TONE:
+
+- Professional and technical
+- Direct and clear
+- No fluff or unnecessary words
+
+EXAMPLES OF GOOD COMMITS:
+
+- feat(auth): add JWT token refresh mechanism
+- fix(api): resolve race condition in user creation
+- perf(db): optimize query with proper indexing
+- refactor(core): simplify error handling logic
+
+AVOID:
+
+- Vague descriptions like “fix stuff” or “update code”
+- Technical jargon without context
+- Overly long explanations
+- Jokes or informal language
