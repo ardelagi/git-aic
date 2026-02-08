@@ -26,6 +26,7 @@ MAX_DIFF=$(get_config "max-diff-size" "12000")
 ENABLE_CHANGELOG=$(get_config "changelog" "true")
 TEMPLATE_FILE=$(get_config "template" "$HOME/.config/git-ai-commit/template.txt")
 GITHUB_TOKEN=$(get_config "github-token" "${GITHUB_TOKEN:-}")
+PUSH_TO_GITHUB=$(get_config "push-to-github" "false")
 
 # =============================================================================
 # HELP & SETUP
@@ -88,11 +89,16 @@ setup_wizard() {
   # Changelog
   read -p "Enable CHANGELOG.md updates? (y/n) [y]: " changelog
   changelog=${changelog:-y}
+
+  # Push to GitHub
+  read -p "Push to GitHub after commit? (y/n) [n]: " push_github
+  push_github=${push_github:-n}
   
   # Save config
   git config --global commit-ai.provider "$PROVIDER"
   git config --global commit-ai.api-key "$api_key"
   git config --global commit-ai.changelog "$([ "$changelog" = "y" ] && echo true || echo false)"
+  git config --global commit-ai.push-to-github "$([ "$push_github" = "y" ] && echo true || echo false)"
   
   echo ""
   echo "✓ Configuration saved!"
@@ -571,6 +577,18 @@ main() {
     else
       echo "⚠️  No git tag found for release creation"
       echo "Create a tag first: git tag v1.0.0"
+    fi
+  fi
+
+  # Push to GitHub if configured
+  if [ "$PUSH_TO_GITHUB" = "true" ]; then
+    read -p "Push to GitHub? (y/n) [y]: " push_choice
+    push_choice=${push_choice:-y}
+    if [ "$push_choice" = "y" ]; then
+      git push
+      echo "✅ Pushed to GitHub successfully"
+    else
+      echo "❌ Push to GitHub cancelled"
     fi
   fi
 }
